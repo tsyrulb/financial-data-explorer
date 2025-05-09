@@ -1,238 +1,290 @@
-import { useState, useEffect } from "react";
-import "./App.css"; // Keep or remove this depending on your styling needs
-import TimeSeriesChart from "./components/TimeSeriesChart"; // Import the new chart component
+import { useState, useEffect, useMemo } from "react";
+import TimeSeriesChart from "./components/TimeSeriesChart";
+import "./App.css"; // Keep your CSS file import
 
-// Define the type for the data we expect from the /api/datasets endpoint
-type DatasetNames = string[];
-
-// Define the type for a single time series data point
-// Matches the JSON structure from /api/data/<dataset_name>
-type TimeSeriesDataPoint = {
+export type TimeSeriesPoint = {
   date: string; // ISO 8601 date string
-  [key: string]: number | string; // The value column name is dynamic (e.g., 'UNRATE', 'CPIAUCSL')
+  // Value can be number or string (like '.') initially, but we expect number after processing
+  [key: string]: number | string;
 };
 
-// Define the type for the fetched time series data
-// A dictionary where keys are dataset names and values are arrays of data points
-type FetchedTimeSeriesData = {
-  [datasetName: string]: TimeSeriesDataPoint[];
-};
+export type SeriesPayload = Record<string, TimeSeriesPoint[]>;
 
-function App() {
-  // State for the list of all available dataset names
-  const [availableDatasets, setAvailableDatasets] = useState<DatasetNames>([]);
+const API = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:5000";
+
+// Helper function to build query string from an object
+const qs = (o: Record<string, string>) =>
+  Object.entries(o)
+    .filter(([, v]) => v) // Filter out empty values
+    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`) // Encode values
+    .join("&"); // Join with &
+
+
+export default function App() {
+  // ── State ────────────────────────────────────────────────────────────────
+  // State for the list of all available dataset names fetched from backend
+  const [datasets, setDatasets] = useState<string[]>([]);
   // State for the dataset names currently selected by the user
-  const [selectedDatasets, setSelectedDatasets] = useState<DatasetNames>([]);
+  const [selected, setSelected] = useState<string[]>([]);
   // State for the actual time series data fetched from the backend for selected datasets
-  const [timeSeriesData, setTimeSeriesData] = useState<FetchedTimeSeriesData>(
-    {}
-  );
+  const [payload, setPayload] = useState<SeriesPayload>({});
 
-  // State to handle loading and errors for fetching the *list* of datasets
-  const [loadingDatasets, setLoadingDatasets] = useState<boolean>(true);
-  const [errorLoadingDatasets, setErrorLoadingDatasets] =
-    useState<Error | null>(null);
+  // State to handle loading and errors for *all* data fetching (catalogue and series)
+  const [loading, setLoading] = useState(false);
+  // State to store error messages
+  const [error, setError] = useState<string | null>(null);
 
-  // State to handle loading and errors for fetching the *time series data*
-  const [loadingTimeSeries, setLoadingTimeSeries] = useState<boolean>(false);
-  const [errorLoadingTimeSeries, setErrorLoadingTimeSeries] =
-    useState<Error | null>(null);
+  // State for filters / transforms (to be sent as query parameters to backend)
+  const [start, setStart] = useState(""); // Start date filter
+  const [end, setEnd] = useState(""); // End date filter
+  const [frequency, setFrequency] = useState("d"); // Data frequency (daily, weekly, etc.)
+  const [transform, setTransform] = useState(""); // Data transformation (index_100, etc.)
 
-  // Define the base URL for your backend API
-  const API_BASE_URL: string = "http://127.0.0.1:5000"; // !! Make sure this matches your backend URL !!
-
-  // --- Effect to fetch the list of available datasets (runs once on mount) ---
+  // ── Catalogue Fetch (runs once on mount) ─────────────────────────────────────
   useEffect(() => {
-    const fetchAvailableDatasets = async (): Promise<void> => {
+    setLoading(true); // Start loading indicator for initial fetch
+    fetch(`${API}/api/datasets`)
+      .then((r) => {
+        if (!r.ok) {
+          throw new Error(`HTTP error fetching datasets: ${r.statusText}`);
+        }
+        return r.json();
+      })
+      .then(setDatasets) // Update state with the list of dataset names
+      .catch((e) => {
+        console.error("Failed to fetch datasets:", e);
+        setError(`Failed to load datasets: ${String(e)}`); // Set error state
+      })
+      .finally(() => setLoading(false)); // End loading indicator
+  }, []); // Empty dependency array means this effect runs only once
+
+  // ── Series Fetch (debounced effect triggered by selections/filters) ────────────
+  useEffect(() => {
+    // If no datasets are selected, clear the payload and stop loading
+    if (!selected.length) {
+      setPayload({});
+      setError(null); // Clear any previous errors
+      setLoading(false); // Ensure loading is false if selection is empty
+      return;
+    }
+
+    // Start loading state when selection or filters change
+    setLoading(true);
+    setError(null); // Clear previous errors
+
+    const ctrl = new AbortController();
+
+    const id = setTimeout(async () => {
       try {
-        setLoadingDatasets(true); // Start loading state
-        const response: Response = await fetch(`${API_BASE_URL}/api/datasets`);
+        const resObj: SeriesPayload = {};
+        // Fetch data for each selected dataset concurrently
+        await Promise.all(
+          selected.map(async (sid) => {
+            // Construct the URL with query parameters for filters/transforms
+            const url = `${API}/api/data/${sid}?` + qs({ start, end, frequency, transform });
+            const res = await fetch(url, { signal: ctrl.signal }); // Pass signal for aborting
+            if (!res.ok) {
+              throw new Error(`${sid}: ${res.statusText || 'Failed to fetch'}`);
+            }
+            const dataPoints: TimeSeriesPoint[] = await res.json();
 
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
-        }
+             const formattedData = dataPoints.map(point => {
+                 const value = point.value !== undefined ? point.value : point[sid]; 
+                 return { date: point.date, [sid]: value } as TimeSeriesPoint;
+             });
 
-        const data: DatasetNames = await response.json();
-        setAvailableDatasets(data); // Store the list of names
-      } catch (error: unknown) {
-        console.error("Failed to fetch available datasets:", error);
-        setErrorLoadingDatasets(
-          error instanceof Error ? error : new Error(String(error))
+
+            resObj[sid] = formattedData; // Store fetched data by dataset name
+          })
         );
-      } finally {
-        setLoadingDatasets(false); // End loading state
-      }
-    };
-
-    fetchAvailableDatasets();
-  }, []); // Empty dependency array means this runs only once
-
-  // --- Handler for selecting/deselecting datasets ---
-  const handleDatasetSelect = (datasetName: string): void => {
-    setSelectedDatasets((prevSelected) => {
-      // Check if the dataset is already selected
-      if (prevSelected.includes(datasetName)) {
-        // If selected, remove it (deselect)
-        return prevSelected.filter((name) => name !== datasetName);
-      } else {
-        // If not selected, add it (select)
-        // Optional: Limit the number of selected datasets for clarity on the chart
-        // if (prevSelected.length < 5) { // Example limit
-        return [...prevSelected, datasetName];
-        // } else {
-        //    alert("You can select up to 5 datasets for comparison.");
-        //    return prevSelected; // Don't add if limit reached
-        // }
-      }
-    });
-  };
-
-  // --- Function to fetch time series data for selected datasets ---
-  const fetchTimeSeriesData = async (): Promise<void> => {
-    if (selectedDatasets.length === 0) {
-      setTimeSeriesData({}); // Clear data if nothing is selected
-      setErrorLoadingTimeSeries(null);
-      return; // Nothing to fetch
-    }
-
-    setLoadingTimeSeries(true); // Start loading state for time series data
-    setErrorLoadingTimeSeries(null); // Clear previous errors
-    const fetchedData: FetchedTimeSeriesData = {};
-
-    try {
-      // Fetch data for each selected dataset concurrently
-      const fetchPromises = selectedDatasets.map(async (datasetName) => {
-        const response = await fetch(`${API_BASE_URL}/api/data/${datasetName}`);
-        if (!response.ok) {
-          // If fetching a single series fails, throw an error to be caught below
-          throw new Error(
-            `Failed to fetch data for ${datasetName}: ${response.statusText}`
-          );
+        // Update the payload state with the fetched data for all selected series
+        setPayload(resObj);
+        setError(null); // Clear error if all fetches were successful
+      } catch (e) {
+        // Catch any errors during the fetch process (network issues, HTTP errors, aborts)
+        if (e instanceof Error) {
+             // Check if the error was due to aborting (user changed selection quickly)
+             if (e.name === 'AbortError') {
+                 console.log('Fetch aborted:', e.message);
+                 // No need to set error state for aborts, just stop loading
+             } else {
+                console.error("Failed to fetch time series data:", e);
+                setError(`Failed to load data: ${e.message}`); // Set error state
+                setPayload({}); // Clear data on error
+             }
+        } else {
+             // Handle unexpected error types
+             console.error("An unexpected error occurred during fetch:", e);
+             setError(`An unexpected error occurred: ${String(e)}`);
+             setPayload({}); // Clear data on error
         }
-        const data: TimeSeriesDataPoint[] = await response.json();
-        fetchedData[datasetName] = data; // Store fetched data by dataset name
-      });
+      } finally {
+        // Set loading to false once fetching is complete (whether success, error, or abort)
+         // Only set loading to false if it's not an abort error, as a new fetch might start immediately
+         if (ctrl.signal.aborted) {
+             console.log("Fetch aborted, new fetch likely started.");
+         } else {
+            setLoading(false); // End loading state
+         }
+      }
+    }, 300); // Debounce delay
 
-      // Wait for all fetch promises to complete
-      await Promise.all(fetchPromises);
+    // Cleanup function: This runs when the component unmounts or when the dependencies change
+    // before the next effect runs. It clears the timeout and aborts the fetch.
+    return () => {
+      clearTimeout(id);
+      ctrl.abort(); // Abort any ongoing fetch requests
+    };
+  }, [selected, start, end, frequency, transform]); // Dependencies: Re-run effect if any of these change
 
-      // Update the state with the fetched data for all selected series
-      setTimeSeriesData(fetchedData);
-    } catch (error: unknown) {
-      console.error("Failed to fetch time series data:", error);
-      setErrorLoadingTimeSeries(
-        error instanceof Error ? error : new Error(String(error))
-      );
-      setTimeSeriesData({}); // Clear data on error
-    } finally {
-      setLoadingTimeSeries(false); // End loading state
-    }
-  };
+  // Memoize the check for whether we have data to display
+  const hasData = useMemo(() => Object.keys(payload).length > 0, [payload]);
 
-  // --- Render the UI ---
+  // Handler for selecting/deselecting datasets (used by the chips)
+  const toggle = (sid: string) => setSelected((p) => (p.includes(sid) ? p.filter((x) => x !== sid) : [...p, sid]));
+
+  // ── UI Layout ────────────────────────────────────────────────────────────
   return (
-    <div className="App">
-      <header className="App-header">
-        <h1>Financial Data Explorer</h1>
+    // Main container with background gradients and minimum height
+    <div className="min-h-screen text-neutral-100 bg-gradient-to-br from-[#111] via-[#1a1a1a] to-[#202225] relative overflow-hidden">
+      {/* Backdrop blob - purely decorative */}
+      <div className="pointer-events-none absolute inset-0 -z-10 bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-teal-600/20 via-indigo-600/10 to-transparent" />
+
+      {/* Header */}
+      <header className="h-14 flex items-center gap-3 pl-4 pr-6 border-b border-neutral-800 backdrop-blur-md bg-neutral-900/60 sticky top-0 z-20">
+        {/* SVG Icon Placeholder - ensure you have this icon defined elsewhere */}
+        {/* Example: In your index.html or as a separate SVG component */}
+        <svg width="18" height="18" className="text-teal-400"><use href="#icon-chart" /></svg>
+        <h1 className="font-semibold tracking-wide text-lg">Financial&nbsp;Data&nbsp;Explorer</h1>
+        {/* Link to FRED website */}
+        <a href="https://fred.stlouisfed.org/" target="_blank" rel="noopener noreferrer" className="ml-auto text-xs text-neutral-400 hover:text-teal-400 transition-colors">Powered by FRED</a>
       </header>
-      <main className="main-content">
-        {" "}
-        {/* Add a class for layout */}
-        <div className="dataset-selection-panel">
-          {" "}
-          {/* Panel for dataset list */}
-          <h2>Available Datasets</h2>
-          {loadingDatasets && <p>Loading datasets list...</p>}
-          {errorLoadingDatasets && (
-            <p>Error loading datasets list: {errorLoadingDatasets.message}</p>
-          )}
-          {!loadingDatasets &&
-            !errorLoadingDatasets &&
-            (availableDatasets.length > 0 ? (
-              <ul>
-                {/* Map over available datasets to create selectable list items */}
-                {availableDatasets.map((datasetName: string, index: number) => (
-                  <li
-                    key={index}
-                    // Add a class to style selected items
-                    className={
-                      selectedDatasets.includes(datasetName) ? "selected" : ""
-                    }
-                    // Add click handler to select/deselect
-                    onClick={() => handleDatasetSelect(datasetName)}
-                    style={{ cursor: "pointer" }} // Indicate it's clickable
-                  >
-                    {datasetName}
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p>No datasets found.</p>
-            ))}
-        </div>
-        <div className="chart-area">
-          {" "}
-          {/* Area for the chart and controls */}
-          <h2>Selected Datasets</h2>
-          {/* Display selected dataset names */}
-          <p>Selected: {selectedDatasets.join(", ") || "None"}</p>
-          {/* Button to trigger data fetching */}
-          <button
-            onClick={fetchTimeSeriesData}
-            disabled={selectedDatasets.length === 0 || loadingTimeSeries} // Disable if nothing selected or loading
-          >
-            {loadingTimeSeries ? "Loading Data..." : "Load Data & Show Chart"}
-          </button>
-          {/* Display loading/error states for time series data */}
-          {errorLoadingTimeSeries && (
-            <p style={{ color: "red" }}>
-              Error loading data: {errorLoadingTimeSeries.message}
-            </p>
-          )}
-          {loadingTimeSeries && <p>Fetching time series data...</p>}
-          {/* --- Charting Component Integration --- */}
-          {/* Render the chart only if data is loaded and there's no error and data is available */}
-          {!loadingTimeSeries &&
-            !errorLoadingTimeSeries &&
-            Object.keys(timeSeriesData).length > 0 && (
-              <div
-                className="data-visualization"
-                style={{ width: "100%", height: "500px" }}
+
+      {/* Main content area - uses grid layout */}
+      <main className="grid md:grid-cols-[260px_1fr] xl:grid-cols-[280px_1fr] gap-6 p-4 pb-10 max-w-screen-2xl mx-auto">
+        {/* Sidebar for dataset selection */}
+        {/* Hidden on small screens, flex column on medium and larger */}
+        <aside className="hidden md:flex flex-col max-h-[85vh] rounded-xl bg-neutral-900/70 border border-neutral-800 backdrop-blur-md overflow-hidden">
+          <div className="px-4 py-3 border-b border-neutral-800">
+            <h2 className="font-medium text-sm tracking-wide">Datasets</h2>
+            {/* Display number of available datasets */}
+            <p className="text-[10px] text-neutral-500">{datasets.length} available</p>
+          </div>
+          {/* Scrollable area for dataset chips */}
+          <div className="flex-1 overflow-y-auto p-3 flex flex-wrap gap-1 content-start">
+            {/* Map through available datasets to create clickable chips */}
+            {datasets.map((sid) => (
+              <button
+                key={sid}
+                onClick={() => toggle(sid)} // Toggle selection on click
+                // Apply active class if dataset is selected
+                className={`dataset-chip ${selected.includes(sid) ? "dataset-chip--active" : ""}`}
               >
-                {" "}
-                {/* Added style for chart container */}
-                {/* Render the TimeSeriesChart component, passing the fetched data */}
-                <TimeSeriesChart data={timeSeriesData} height={500} />{" "}
-                {/* Pass height prop */}
+                {sid}
+              </button>
+            ))}
+          </div>
+        </aside>
+
+        {/* Main column for controls and chart */}
+        <section className="flex flex-col gap-6">
+          {/* Controls panel for filters and transforms */}
+          <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-4 p-4 rounded-xl bg-neutral-900/70 backdrop-blur-md border border-neutral-800">
+            {/* Date inputs (Start and End) */}
+            {[{ lbl: "Start", val: start, set: setStart }, { lbl: "End", val: end, set: setEnd }].map(({ lbl, val, set }) => (
+              <div key={lbl} className="flex flex-col gap-1">
+                <label className="text-[11px] text-neutral-400">{lbl}</label>
+                {/* Input type date with value and change handler */}
+                <input type="date" value={val} onChange={(e) => set(e.target.value)} />
+              </div>
+            ))}
+            {/* Frequency Select */}
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-neutral-400">Freq</label>
+              <select value={frequency} onChange={(e) => setFrequency(e.target.value)}>
+                <option value="d">Daily</option>
+                <option value="w">Weekly</option>
+                <option value="m">Monthly</option>
+                <option value="q">Quarterly</option>
+                <option value="a">Annual</option>
+              </select>
+            </div>
+            {/* Transform Select */}
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-neutral-400">Transform</label>
+              <select value={transform} onChange={(e) => setTransform(e.target.value)}>
+                <option value="">None</option>
+                <option value="index_100">Index 100</option>
+                {/* Add other transform options as implemented in backend */}
+                {/* <option value="pct_change">% Change</option> */}
+                {/* <option value="log_return">Log Return</option> */}
+              </select>
+            </div>
+            {/* Clear Selection Button */}
+            <button
+              onClick={() => setSelected([])}
+              className="col-span-2 sm:col-span-1 flex items-center justify-center rounded bg-red-600/70 hover:bg-red-600 transition-colors text-xs font-medium px-4 py-2" // Added padding for better click area
+            >
+              Clear Selection
+            </button>
+          </div>
+
+          {/* Chart Area */}
+          <div className="relative flex-1 min-h-[420px] rounded-xl bg-neutral-900/70 border border-neutral-800 backdrop-blur-md p-4 flex items-center justify-center"> {/* Added flex centering for messages */}
+            {/* Loading Overlay */}
+            {loading && (
+              <div className="absolute inset-0 flex items-center justify-center bg-neutral-900/60 backdrop-blur-sm rounded-xl z-10">
+                <span className="animate-pulse text-neutral-400 text-sm">Fetching data…</span>
               </div>
             )}
-          {/* Message to prompt user to load data */}
-          {!loadingTimeSeries &&
-            !errorLoadingTimeSeries &&
-            selectedDatasets.length > 0 &&
-            Object.keys(timeSeriesData).length === 0 && (
-              <p>Click "Load Data & Show Chart" to fetch data.</p>
+            {/* Error Message */}
+            {error && !loading && (
+              <div className="text-red-400 text-sm text-center">
+                <p>Error: {error}</p>
+                {/* Optional: Add a retry button */}
+                {/* <button onClick={fetchSeriesData} className="mt-2 text-blue-400 hover:underline">Retry</button> */}
+              </div>
             )}
-          {/* Message when no datasets are selected */}
-          {!loadingDatasets &&
-            !errorLoadingDatasets &&
-            selectedDatasets.length === 0 && (
-              <p>Select datasets from the list to the left.</p>
+            {/* Chart Component or Placeholder Messages */}
+            {!loading && !error && (
+              hasData ? (
+                // Render the TimeSeriesChart component if data is available
+                // Pass the fetched payload and set a height
+                <div style={{ width: '100%', height: '100%' }}> {/* Container to make chart fill area */}
+                    <TimeSeriesChart data={payload} height={400} /> {/* Pass data and height */}
+                </div>
+              ) : (
+                // Display message if no data is available
+                <div className="text-neutral-500 text-sm text-center">
+                    {selected.length ? "No data for selected parameters or series." : "Select datasets on the left to visualize data."}
+                </div>
+              )
             )}
-          {/* --- Controls for Correlation/Transformations Placeholder --- */}
-          {/* This is where you'll add controls for rolling correlation, normalization, etc. */}
-          <div className="controls-panel">
-            <h3>Analysis Controls Placeholder</h3>
-            <p>
-              Add controls for rolling correlation, normalization, event markers
-              here.
-            </p>
-            {/* Example: <CorrelationControls selectedDatasets={selectedDatasets} onCalculate={handleCalculateCorrelation} /> */}
           </div>
-        </div>
+
+          {/* Controls for Correlation/Transformations Placeholder (Future) */}
+          {/* You can add more complex controls here later */}
+          {/*
+          <div className="controls-panel p-4 rounded-xl bg-neutral-900/70 backdrop-blur-md border border-neutral-800">
+             <h3>Analysis Controls</h3>
+             <p className="text-neutral-400 text-sm">Add controls for rolling correlation, event markers here.</p>
+             {/* Example: <CorrelationControls selectedDatasets={selected} onCalculate={handleCalculateCorrelation} /> }
+          </div>
+          */}
+
+        </section>
       </main>
+
+       {/* Mobile Dataset Selection (Optional - requires more work) */}
+       {/* You might want a modal or slide-out panel for dataset selection on small screens */}
+       {/*
+       <div className="md:hidden fixed bottom-4 right-4 z-30">
+           <button className="p-3 rounded-full bg-teal-600 text-white shadow-lg">
+               <svg width="24" height="24"><use href="#icon-list" /></svg>
+           </button>
+       </div>
+       */}
+
     </div>
   );
 }
-
-export default App;
